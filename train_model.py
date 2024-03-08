@@ -1,16 +1,13 @@
-# This code demonstrates how to train a Texture Refinement model using a custom dataset. 
-#The training process utilizes a ResNet18 as a base for feature extraction, combined with a custom Attention Module and Texture Refiner to enhance the details and textures of images. 
-#The model aims to refine images by emphasizing texture details, making it especially useful for improving image quality in tasks that require high levels of visual detail. 
-#The script includes the setup for a VGG-based Perceptual Loss to complement traditional MSE loss, aiming to capture and enhance texture in a more perceptually relevant manner. 
+# This is a texture refinement model leveraging a U-Net architecture and adversarial training to enhance image textures. 
+#The model combines MSE loss for content fidelity and adversarial loss from a pre-trained VGG19 to produce images with realistic and detailed textures. 
+#It's designed for applications where high-quality visual detail is crucial.
+
 import torch
-import torch.nn as nn
-import torch.optim as optim
+from torch import nn, optim
 from torch.utils.data import DataLoader
 from torchvision import datasets, transforms
 import torchvision.models as models
-from typing import Tuple
 
-# Dataset path - Update this path to your dataset location
 dataset_path = "/path/to/your/images"
 
 # Transformations
@@ -23,94 +20,88 @@ transform = transforms.Compose([
 dataset = datasets.ImageFolder(root=dataset_path, transform=transform)
 dataloader = DataLoader(dataset, batch_size=32, shuffle=True)
 
-# Define the Attention Module
-class AttentionModule(nn.Module):
-    def __init__(self, in_channels):
-        super(AttentionModule, self).__init__()
-        self.conv = nn.Conv2d(in_channels, in_channels // 8, kernel_size=1)
-        self.gamma = nn.Parameter(torch.zeros(1))
-
-    def forward(self, x):
-        attention_map = self.conv(x)
-        attention_map = torch.sigmoid(attention_map)
-        x = x * attention_map * self.gamma + x
-        return x
-
-# Define the Texture Refiner Model
-class TextureRefinerCNN(nn.Module):
+#Texture Refiner Model
+class TextureRefinerUNet(nn.Module):
     def __init__(self):
-        super(TextureRefinerCNN, self).__init__()
-        self.base_model = models.resnet18(pretrained=True)
-        self.features = nn.Sequential(*list(self.base_model.children())[:-2])
-        self.attention = AttentionModule(512)
-        self.refiner = nn.Sequential(
-            nn.Conv2d(512, 256, kernel_size=3, padding=1),
+        super(TextureRefinerUNet, self).__init__()
+
+        self.encoder = nn.Sequential(
+            nn.Conv2d(3, 64, 3, stride=1, padding=1),
             nn.ReLU(inplace=True),
-            nn.Conv2d(256, 256, kernel_size=3, padding=1),
+            nn.Conv2d(64, 64, 3, stride=1, padding=1),
             nn.ReLU(inplace=True),
-            nn.ConvTranspose2d(256, 256, kernel_size=2, stride=2),
+            nn.MaxPool2d(2, stride=2),
+
+            nn.Conv2d(64, 128, 3, stride=1, padding=1),
             nn.ReLU(inplace=True),
-            nn.Conv2d(256, 3, kernel_size=3, padding=1),
-            nn.Tanh()
+            nn.Conv2d(128, 128, 3, stride=1, padding=1),
+            nn.ReLU(inplace=True),
+            nn.MaxPool2d(2, stride=2),
+
+            nn.Conv2d(128, 256, 3, stride=1, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(256, 256, 3, stride=1, padding=1),
+            nn.ReLU(inplace=True),
+            nn.MaxPool2d(2, stride=2),
+        )
+
+        self.decoder = nn.Sequential(
+            nn.ConvTranspose2d(256, 128, 2, stride=2),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(128, 128, 3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(128, 128, 3, padding=1),
+            nn.ReLU(inplace=True),
+
+            nn.ConvTranspose2d(128, 64, 2, stride=2),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(64, 64, 3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(64, 64, 3, padding=1),
+            nn.ReLU(inplace=True),
+
+            nn.ConvTranspose2d(64, 3, 2, stride=2),
+            nn.Tanh(),
         )
 
     def forward(self, x):
-        x = self.features(x)
-        x = self.attention(x)
-        x = self.refiner(x)
-        return x
+        encoded = self.encoder(x)
+        decoded = self.decoder(encoded)
+        return decoded
 
-# Define the VGG-based Perceptual Loss
-class VGGPerceptualLoss(nn.Module):
-    def __init__(self, vgg_model):
-        super(VGGPerceptualLoss, self).__init__()
-        self.vgg_layers = vgg_model.features[:31]
-        self.layer_weights = [1.0 / 2.6, 1.0 / 4.8, 1.0 / 3.7, 1.0 / 5.6, 10 / 1.5]
+# Instantiate the model, loss function, optimizer
+model = TextureRefinerUNet().to('cuda')
+criterion = nn.MSELoss()
+adversarial_criterion = nn.BCEWithLogitsLoss()
+adversary = models.vgg19(pretrained=True).features[:36].to('cuda')
+adversary.eval()
 
-    def forward(self, input, target):
-        input_features = self.get_features(input)
-        target_features = self.get_features(target)
-        loss = 0
-        for i, (input_feat, target_feat) in enumerate(zip(input_features, target_features)):
-            loss += self.layer_weights[i] * nn.functional.l1_loss(input_feat, target_feat)
-        return loss
-
-    def get_features(self, x):
-        features = []
-        for i, layer in enumerate(self.vgg_layers):
-            x = layer(x)
-            if i in [3, 8, 15, 22, 29]:
-                features.append(x)
-        return features
-
-# Instantiate the model, loss functions, and optimizer
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-model = TextureRefinerCNN().to(device)
-vgg_model = models.vgg19(pretrained=True).features.to(device)
-vgg_model.eval()
-perceptual_loss = VGGPerceptualLoss(vgg_model).to(device)
-mse_loss = nn.MSELoss()
-loss_weights = [1.0, 0.1]  # Adjust these weights as needed
 optimizer = optim.Adam(model.parameters(), lr=0.001)
 
 # Training loop
-num_epochs = 10  # Adjust the number of epochs based on your need
+num_epochs = 10
 for epoch in range(num_epochs):
     for inputs, _ in dataloader:
-        inputs = inputs.to(device)
+        inputs = inputs.to('cuda')
 
         # Forward pass
         outputs = model(inputs)
-        mse_loss_value = mse_loss(outputs, inputs)
-        perceptual_loss_value = perceptual_loss(outputs, inputs)
-        total_loss = loss_weights[0] * mse_loss_value + loss_weights[1] * perceptual_loss_value
+        loss = criterion(outputs, inputs)
+
+        # Adversarial loss
+        real_features = adversary(inputs)
+        fake_features = adversary(outputs)
+        adversarial_loss = adversarial_criterion(fake_features, torch.zeros_like(fake_features))
+        adversarial_loss += adversarial_criterion(real_features, torch.ones_like(real_features))
+
+        total_loss = loss + 0.01 * adversarial_loss  # Adjust the weight for adversarial loss
 
         # Backward and optimize
         optimizer.zero_grad()
         total_loss.backward()
         optimizer.step()
 
-        print(f'Epoch [{epoch+1}/{num_epochs}], MSE Loss: {mse_loss_value.item():.4f}, Perceptual Loss: {perceptual_loss_value.item():.4f}')
+    print(f'Epoch [{epoch+1}/{num_epochs}], Loss: {loss.item():.4f}, Adversarial Loss: {adversarial_loss.item():.4f}')
 
+# Save the model
 torch.save(model.state_dict(), 'texture_refiner_model.pth')
-print('Model trained and saved successfully.')
